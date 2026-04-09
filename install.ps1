@@ -4,6 +4,12 @@
 #>
 
 $ErrorActionPreference = "Stop"
+
+# Helper: ghi file UTF-8 KHONG co BOM (PowerShell 5.1 mac dinh ghi BOM)
+function Write-Utf8NoBom([string]$Path, [string]$Content) {
+    [System.IO.File]::WriteAllText($Path, $Content, (New-Object System.Text.UTF8Encoding $false))
+}
+
 $ScriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ClaudeDir  = Join-Path $env:USERPROFILE ".claude"
 $ConfigFile = Join-Path $ClaudeDir "config.json"
@@ -78,7 +84,7 @@ $configContent = [ordered]@{
     bot_token = $BotToken
     chat_id   = $ChatId
 }
-$configContent | ConvertTo-Json | Set-Content $ConfigFile -Encoding UTF8
+Write-Utf8NoBom $ConfigFile ($configContent | ConvertTo-Json)
 Write-Host "  [+] config.json -> $ConfigFile" -ForegroundColor Green
 
 # ── Buoc 4: Merge hook vao settings.json ──────────────────────────────────────
@@ -121,7 +127,7 @@ if (Test-Path $SettingsFile) {
             $settings.hooks | Add-Member -NotePropertyName "Stop" -NotePropertyValue @($newEntry) -Force
         }
 
-        $settings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
+        Write-Utf8NoBom $SettingsFile ($settings | ConvertTo-Json -Depth 10)
         Write-Host "  [+] Da them Telegram hook vao settings.json" -ForegroundColor Green
     }
 } else {
@@ -137,7 +143,7 @@ if (Test-Path $SettingsFile) {
             })
         }
     }
-    $newSettings | ConvertTo-Json -Depth 10 | Set-Content $SettingsFile -Encoding UTF8
+    Write-Utf8NoBom $SettingsFile ($newSettings | ConvertTo-Json -Depth 10)
     Write-Host "  [+] Da tao settings.json voi Telegram hook" -ForegroundColor Green
 }
 
