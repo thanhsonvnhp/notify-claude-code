@@ -41,46 +41,113 @@ def load_config():
     return bot_token, chat_id
 
 
-def get_session_token_usage(session_id, cwd):
-    """Tính tổng token usage từ transcript file của session."""
+# Bảng giá chính chủ Anthropic, đơn vị: USD cho 1 triệu token.
+# API không trả về giá/chi phí (usage chỉ có số token) nên phải giữ bảng giá ở đây.
+# Nguồn: https://platform.claude.com/docs/en/about-claude/pricing — cập nhật 15/10/2026.
+PRICING = {
+    # model                 input   ghi cache 5m  ghi cache 1h  đọc cache   output
+    "claude-fable-5-1":   ( 10.00,     12.50,        20.00,       0.25,      50.00),
+    "claude-mythos-5-1":  ( 10.00,     12.50,        20.00,       0.25,      50.00),
+    "claude-fable-5":     ( 10.00,     12.50,        20.00,       1.00,      50.00),
+    "claude-mythos-5":    ( 10.00,     12.50,        20.00,       1.00,      50.00),
+
+    "claude-opus-5-5":    (  4.00,      5.00,         8.00,       0.20,      20.00),
+    "claude-opus-5":      (  5.00,      6.25,        10.00,       0.50,      25.00),
+    "claude-opus-4-8":    (  5.00,      6.25,        10.00,       0.50,      25.00),
+    "claude-opus-4-7":    (  5.00,      6.25,        10.00,       0.50,      25.00),
+    "claude-opus-4-6":    (  5.00,      6.25,        10.00,       0.50,      25.00),
+    "claude-opus-4-5":    (  5.00,      6.25,        10.00,       0.50,      25.00),
+    "claude-opus-4-1":    ( 15.00,     18.75,        30.00,       1.50,      75.00),
+    "claude-opus-4":      ( 15.00,     18.75,        30.00,       1.50,      75.00),
+
+    "claude-sonnet-5-5":  (  2.00,      2.50,         4.00,       0.10,      10.00),
+    "claude-sonnet-5":    (  2.00,      2.50,         4.00,       0.20,      10.00),
+    "claude-sonnet-4-6":  (  3.00,      3.75,         6.00,       0.30,      15.00),
+    "claude-sonnet-4-5":  (  3.00,      3.75,         6.00,       0.30,      15.00),
+    "claude-sonnet-4":    (  3.00,      3.75,         6.00,       0.30,      15.00),
+
+    "claude-haiku-5-5":   (  0.10,      0.125,        0.20,       0.01,       0.50),
+    "claude-haiku-4-5":   (  1.00,      1.25,         2.00,       0.10,       5.00),
+    "claude-3-5-haiku":   (  0.80,      1.00,         1.60,       0.08,       4.00),
+}
+# Haiku 5.5 khi prompt dài hơn 100K token (tính cả cache) thì dùng giá này
+#                       input   ghi cache 5m  ghi cache 1h  đọc cache   output
+HAIKU_5_5_LONG =      (  0.50,      0.625,        1.00,       0.05,       2.50)
+
+
+def model_price(model, prompt_tokens):
+    """Tìm giá theo tiền tố dài nhất của model id (bỏ qua hậu tố ngày, [1m]...)."""
+    keys = [k for k in PRICING if model.startswith(k)]
+    if not keys:
+        return None
+    key = max(keys, key=len)
+    if key == "claude-haiku-5-5" and prompt_tokens > 100_000:
+        return HAIKU_5_5_LONG
+    return PRICING[key]
+
+
+def message_cost(model, u):
+    """Chi phí 1 response theo giá model. None nếu model chưa có trong bảng giá.
+    shortcut: chưa tính phụ phí fast mode / inference_geo=us (x1.1) / long-context Sonnet 4.5 trở về trước."""
+    inp = u.get("input_tokens", 0) or 0
+    cw = u.get("cache_creation_input_tokens", 0) or 0
+    cr = u.get("cache_read_input_tokens", 0) or 0
+    out = u.get("output_tokens", 0) or 0
+    price = model_price(model, inp + cw + cr)
+    if price is None:
+        return None
+    p_in, p_w5, p_w1, p_read, p_out = price
+    # Tách ghi cache 5m / 1h nếu transcript có; không có thì coi là 5m
+    split = u.get("cache_creation") or {}
+    cw_1h = split.get("ephemeral_1h_input_tokens", 0) or 0
+    cw_5m = cw - cw_1h
+    return (inp * p_in + cw_5m * p_w5 + cw_1h * p_w1 + cr * p_read + out * p_out) / 1_000_000
+
+
+def get_session_token_usage(transcript_file, session_id, cwd):
+    """Tính token usage + chi phí từ transcript.
+    Trả về ((input, cache_write, cache_read, output), cost_usd, models_chưa_có_giá)."""
     try:
-        home = os.path.expanduser("~")
-        cwd_normalized = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
-        project_dir = os.path.join(home, ".claude", "projects", cwd_normalized)
-
-        if not os.path.exists(project_dir):
-            return 0, 0
-
-        transcript_file = os.path.join(project_dir, f"{session_id}.jsonl")
+        if not transcript_file or not os.path.exists(transcript_file):
+            # Fallback: tự dựng đường dẫn, tôn trọng CLAUDE_CONFIG_DIR (vd ~/.claude-official)
+            config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+            cwd_normalized = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+            transcript_file = os.path.join(config_dir, "projects", cwd_normalized, f"{session_id}.jsonl")
         if not os.path.exists(transcript_file):
-            return 0, 0
+            return (0, 0, 0, 0), 0.0, set()
 
-        total_input = 0
-        total_output = 0
-
+        # Một response bị ghi thành nhiều dòng cùng message.id → chỉ tính 1 lần
+        usage_by_id = {}
         with open(transcript_file, "r", encoding="utf-8") as f:
             for line in f:
                 try:
-                    data = json.loads(line)
-                    msg = data.get("message", {})
-                    if isinstance(msg, dict):
-                        usage = msg.get("usage", {})
-                        if isinstance(usage, dict):
-                            total_input += usage.get("input_tokens", 0)
-                            total_output += usage.get("output_tokens", 0)
+                    msg = json.loads(line).get("message", {})
+                    if isinstance(msg, dict) and isinstance(msg.get("usage"), dict):
+                        usage_by_id[msg.get("id") or len(usage_by_id)] = (msg.get("model") or "", msg["usage"])
                 except (json.JSONDecodeError, AttributeError):
                     continue
 
-        return total_input, total_output
+        totals = [0, 0, 0, 0]
+        cost = 0.0
+        unknown_models = set()
+        for model, u in usage_by_id.values():
+            tokens = [
+                u.get("input_tokens", 0) or 0,
+                u.get("cache_creation_input_tokens", 0) or 0,
+                u.get("cache_read_input_tokens", 0) or 0,
+                u.get("output_tokens", 0) or 0,
+            ]
+            if not any(tokens):
+                continue  # vd model "<synthetic>" không tốn token
+            totals = [a + b for a, b in zip(totals, tokens)]
+            c = message_cost(model, u)
+            if c is None:
+                unknown_models.add(model or "?")
+            else:
+                cost += c
+        return tuple(totals), cost, unknown_models
     except Exception:
-        return 0, 0
-
-
-def estimate_cost(input_tokens, output_tokens):
-    """Ước tính chi phí (USD). Giá mặc định: Sonnet 4 — $3/1M input, $15/1M output."""
-    input_cost = (input_tokens / 1_000_000) * 3.0
-    output_cost = (output_tokens / 1_000_000) * 15.0
-    return input_cost + output_cost
+        return (0, 0, 0, 0), 0.0, set()
 
 
 def send_telegram_message(bot_token, chat_id, message):
@@ -154,8 +221,11 @@ def main():
 
         # Token usage
         session_id = hook_data.get("session_id", "")
-        input_tokens, output_tokens = get_session_token_usage(session_id, cwd)
-        total_tokens = input_tokens + output_tokens
+        (input_tokens, cache_write, cache_read, output_tokens), cost, unknown_models = get_session_token_usage(
+            hook_data.get("transcript_path", ""), session_id, cwd
+        )
+        all_input = input_tokens + cache_write + cache_read
+        total_tokens = all_input + output_tokens
 
         # Build message
         lines = [
@@ -171,12 +241,16 @@ def main():
         ]
 
         if total_tokens > 0:
-            cost = estimate_cost(input_tokens, output_tokens)
-            lines.append(
+            # Phiên nhỏ (< 1 cent) cần thêm số lẻ mới thấy được chi phí
+            cost_str = f"${cost:.2f}" if cost >= 0.01 else f"${cost:.4f}"
+            lines.extend([
                 f"🔢 <b>Tokens:</b>  {format_tokens(total_tokens)}"
-                f"  (↓{format_tokens(input_tokens)} / ↑{format_tokens(output_tokens)})"
-            )
-            lines.append(f"💰 <b>Chi phí ước tính:</b>  ~${cost:.4f}")
+                f"  (↓{format_tokens(all_input)} / ↑{format_tokens(output_tokens)})",
+                f"💾 <b>Cache:</b>  đọc {format_tokens(cache_read)} / ghi {format_tokens(cache_write)}",
+                f"💰 <b>Chi phí ước tính:</b>  ~{cost_str}",
+            ])
+            if unknown_models:
+                lines.append(f"⚠️ Chưa có giá cho: <code>{', '.join(sorted(unknown_models))}</code>")
 
         lines.extend([
             "",
